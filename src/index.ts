@@ -4,7 +4,7 @@ import { DragonSwapV1Service } from './services/dragonswap-v1.js';
 import { DRAGONSWAP_V1_CONFIG, DRAGONSWAP_V1_TEST_CONFIG } from './config/constants.js';
 
 export const configSchema = z.object({
-  privateKey: z.string().describe('Private key for signing transactions'),
+  privateKey: z.string().describe('Private key for signing transactions').optional(),
 });
 
 const listPoolsSchema = z.object({

@@ -28,21 +28,33 @@ const wseiAbi = ['function deposit() public payable', 'function withdraw(uint wa
 export class DragonSwapV1Service {
   private provider: ethers.JsonRpcProvider;
   private factoryContract: ethers.Contract;
-  private routerContract: ethers.Contract; // For write operations (swaps)
   private routerContractReadOnly: ethers.Contract; // For read operations (quotes)
-  private wallet: ethers.Wallet;
+  private wallet: ethers.Wallet | undefined;
+  private routerContract: ethers.Contract | undefined; // For write operations (swaps)
 
-  constructor(private config: DragonSwapV1Config, private privateKey: string) {
+  constructor(private config: DragonSwapV1Config, private privateKey?: string) {
     this.provider = new ethers.JsonRpcProvider(config.rpcUrl);
     this.factoryContract = new ethers.Contract(config.factoryAddress, factoryAbi, this.provider);
-    this.wallet = new ethers.Wallet(privateKey, this.provider);
-    this.routerContract = new ethers.Contract(config.routerAddress, routerAbi, this.wallet);
     this.routerContractReadOnly = new ethers.Contract(config.routerAddress, routerAbi, this.provider);
+  }
+
+  private _getWallet(): ethers.Wallet {
+    if (this.wallet) {
+      return this.wallet;
+    }
+
+    if (!this.privateKey || this.privateKey.length !== 64) {
+      throw new Error('A valid 64-character private key is not configured. Please provide it in your session configuration.');
+    }
+
+    this.wallet = new ethers.Wallet(this.privateKey, this.provider);
+    this.routerContract = new ethers.Contract(this.config.routerAddress, routerAbi, this.wallet);
+    return this.wallet;
   }
 
   async getAllPools(): Promise<any[]> {
     const pairCount = await this.factoryContract.allPairsLength();
-    const pools = [];
+    const pools: any[] = [];
 
     for (let i = 0; i < pairCount; i++) {
       try {
@@ -108,7 +120,9 @@ export class DragonSwapV1Service {
   }
 
   async executeSwap(tokenIn: string, tokenOut: string, amountIn: string): Promise<string> {
-    const tokenInContract = new ethers.Contract(tokenIn, erc20Abi, this.wallet);
+    const wallet = this._getWallet();
+    const routerContract = this.routerContract!;
+    const tokenInContract = new ethers.Contract(tokenIn, erc20Abi, wallet);
     const decimals = await tokenInContract.decimals();
     const parsedAmountIn = ethers.parseUnits(amountIn, decimals);
 
@@ -116,16 +130,16 @@ export class DragonSwapV1Service {
     const approveTx = await tokenInContract.approve(this.config.routerAddress, parsedAmountIn);
     await approveTx.wait();
 
-    const amountsOut = await this.routerContract.getAmountsOut(parsedAmountIn, [tokenIn, tokenOut]);
-    const amountOutMin = amountsOut[1] * BigInt(99) / BigInt(100); // 1% slippage tolerance
+    const amountsOut = await this.routerContractReadOnly.getAmountsOut(parsedAmountIn, [tokenIn, tokenOut]);
+    const amountOutMin = (amountsOut[1] * BigInt(99)) / BigInt(100); // 1% slippage tolerance
 
     const deadline = Math.floor(Date.now() / 1000) + 60 * 20; // 20 minutes from now
 
-    const tx = await this.routerContract.swapExactTokensForTokens(
+    const tx = await routerContract.swapExactTokensForTokens(
       parsedAmountIn,
       amountOutMin,
       [tokenIn, tokenOut],
-      this.wallet.address,
+      wallet.address,
       deadline
     );
 
@@ -134,12 +148,13 @@ export class DragonSwapV1Service {
   }
 
   async wrapSei(amount: string): Promise<string> {
+    const wallet = this._getWallet();
     console.log(`Attempting to wrap ${amount} SEI`);
-    const wseiContract = new ethers.Contract(this.config.wseiAddress, wseiAbi, this.wallet);
+    const wseiContract = new ethers.Contract(this.config.wseiAddress, wseiAbi, wallet);
     const valueToWrap = ethers.parseUnits(amount, 6);
     console.log(`Calculated value (in wei, 6 decimals): ${valueToWrap.toString()}`);
     console.log(`wSEI Contract Address: ${this.config.wseiAddress}`);
-    console.log(`Signer Address: ${this.wallet.address}`);
+    console.log(`Signer Address: ${wallet.address}`);
 
     try {
       const tx = await wseiContract.deposit({
@@ -156,7 +171,8 @@ export class DragonSwapV1Service {
   }
 
   async approveWsei(amount: string): Promise<string> {
-    const wseiContract = new ethers.Contract(this.config.wseiAddress, erc20Abi, this.wallet);
+    const wallet = this._getWallet();
+    const wseiContract = new ethers.Contract(this.config.wseiAddress, erc20Abi, wallet);
     const decimals = await wseiContract.decimals();
     const parsedAmount = ethers.parseUnits(amount, decimals);
 
