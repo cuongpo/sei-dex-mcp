@@ -1,0 +1,122 @@
+import { ethers } from 'ethers';
+const factoryAbi = [
+    'function allPairs(uint256) external view returns (address pair)',
+    'function allPairsLength() external view returns (uint256)',
+];
+const pairAbi = [
+    'function token0() external view returns (address)',
+    'function token1() external view returns (address)',
+    'function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
+];
+const erc20Abi = [
+    'function symbol() external view returns (string)',
+    'function decimals() external view returns (uint8)',
+    'function approve(address spender, uint256 amount) external returns (bool)',
+];
+const routerAbi = [
+    'function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts)',
+    'function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)',
+];
+const wseiAbi = ['function deposit() public payable', 'function withdraw(uint wad) public'];
+export class DragonSwapV1Service {
+    constructor(config, privateKey) {
+        this.config = config;
+        this.privateKey = privateKey;
+        this.provider = new ethers.JsonRpcProvider(config.rpcUrl);
+        this.factoryContract = new ethers.Contract(config.factoryAddress, factoryAbi, this.provider);
+        this.wallet = new ethers.Wallet(privateKey, this.provider);
+        this.routerContract = new ethers.Contract(config.routerAddress, routerAbi, this.wallet);
+        this.routerContractReadOnly = new ethers.Contract(config.routerAddress, routerAbi, this.provider);
+    }
+    async getAllPools() {
+        const pairCount = await this.factoryContract.allPairsLength();
+        const pools = [];
+        for (let i = 0; i < pairCount; i++) {
+            try {
+                const pairAddress = await this.factoryContract.allPairs(i);
+                if (pairAddress === ethers.ZeroAddress) {
+                    continue;
+                }
+                const pairContract = new ethers.Contract(pairAddress, pairAbi, this.provider);
+                const [token0Address, token1Address, reserves] = await Promise.all([
+                    pairContract.token0(),
+                    pairContract.token1(),
+                    pairContract.getReserves(),
+                ]);
+                const token0Contract = new ethers.Contract(token0Address, erc20Abi, this.provider);
+                const token1Contract = new ethers.Contract(token1Address, erc20Abi, this.provider);
+                const [token0Symbol, token1Symbol, token0Decimals, token1Decimals] = await Promise.all([
+                    token0Contract.symbol(),
+                    token1Contract.symbol(),
+                    token0Contract.decimals(),
+                    token1Contract.decimals(),
+                ]);
+                pools.push({
+                    pairAddress,
+                    token0: {
+                        address: token0Address,
+                        symbol: token0Symbol,
+                        decimals: token0Decimals.toString(),
+                    },
+                    token1: {
+                        address: token1Address,
+                        symbol: token1Symbol,
+                        decimals: token1Decimals.toString(),
+                    },
+                    reserves: {
+                        reserve0: reserves.reserve0.toString(),
+                        reserve1: reserves.reserve1.toString(),
+                    },
+                });
+            }
+            catch (error) {
+                console.error(`Failed to fetch details for pair at index ${i}. Skipping.`);
+            }
+        }
+        return pools;
+    }
+    async getQuote(tokenIn, tokenOut, amountIn) {
+        const tokenInContract = new ethers.Contract(tokenIn, erc20Abi, this.provider);
+        const decimals = await tokenInContract.decimals();
+        const parsedAmountIn = ethers.parseUnits(amountIn, decimals);
+        const amountsOut = await this.routerContractReadOnly.getAmountsOut(parsedAmountIn, [tokenIn, tokenOut]);
+        const tokenOutContract = new ethers.Contract(tokenOut, erc20Abi, this.provider);
+        const outDecimals = await tokenOutContract.decimals();
+        return ethers.formatUnits(amountsOut[1], outDecimals);
+    }
+    async executeSwap(tokenIn, tokenOut, amountIn) {
+        const tokenInContract = new ethers.Contract(tokenIn, erc20Abi, this.wallet);
+        const decimals = await tokenInContract.decimals();
+        const parsedAmountIn = ethers.parseUnits(amountIn, decimals);
+        // Approve the router to spend the tokens
+        const approveTx = await tokenInContract.approve(this.config.routerAddress, parsedAmountIn);
+        await approveTx.wait();
+        const amountsOut = await this.routerContract.getAmountsOut(parsedAmountIn, [tokenIn, tokenOut]);
+        const amountOutMin = amountsOut[1] * BigInt(99) / BigInt(100); // 1% slippage tolerance
+        const deadline = Math.floor(Date.now() / 1000) + 60 * 20; // 20 minutes from now
+        const tx = await this.routerContract.swapExactTokensForTokens(parsedAmountIn, amountOutMin, [tokenIn, tokenOut], this.wallet.address, deadline);
+        await tx.wait();
+        return tx.hash;
+    }
+    async wrapSei(amount) {
+        console.log(`Attempting to wrap ${amount} SEI`);
+        const wseiContract = new ethers.Contract(this.config.wseiAddress, wseiAbi, this.wallet);
+        const valueToWrap = ethers.parseUnits(amount, 6);
+        console.log(`Calculated value (in wei, 6 decimals): ${valueToWrap.toString()}`);
+        console.log(`wSEI Contract Address: ${this.config.wseiAddress}`);
+        console.log(`Signer Address: ${this.wallet.address}`);
+        try {
+            const tx = await wseiContract.deposit({
+                value: valueToWrap,
+            });
+            console.log('Transaction sent:', tx.hash);
+            await tx.wait();
+            console.log('Transaction confirmed.');
+            return tx.hash;
+        }
+        catch (error) {
+            console.error('Error during wrapSei execution:', error);
+            throw error; // Re-throw the error to be caught by the tool handler
+        }
+    }
+}
